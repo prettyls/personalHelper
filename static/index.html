@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Personal Assistant</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>🤖 Personal Assistant</h1>
+    <button id="clearBtn" title="Clear conversation">🗑️ Clear</button>
+  </header>
+
+  <div id="chat"></div>
+
+  <!-- Webcam preview (hidden until activated) -->
+  <div id="webcam-container" class="hidden">
+    <video id="webcam" autoplay playsinline muted></video>
+    <button id="captureBtn">📸 Capture &amp; Ask</button>
+    <button id="closeWebcam">✕</button>
+  </div>
+
+  <div id="input-bar">
+    <textarea id="msgInput" rows="1" placeholder="Type a message…"></textarea>
+    <button id="sendBtn" title="Send">➤</button>
+    <button id="micBtn" title="Voice input">🎤</button>
+    <button id="camBtn" title="Webcam input">📷</button>
+    <button id="uploadBtn" title="Upload image">🖼️</button>
+    <input type="file" id="uploadInput" accept="image/*" hidden />
+  </div>
+</div>
+<script src="/static/main.js"></script>
+</body>
+</html>
