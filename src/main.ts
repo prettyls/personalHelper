@@ -161,7 +161,11 @@ closeWcBtn.addEventListener("click", closeWebcam);
 // ── shared image send ────────────────────────────────────
 async function sendImageWithQuestion(b64: string): Promise<void> {
   const userText = msgInput.value.trim() || "What do you see?";
-  addMsg("user", `📷 [image] ${userText}`);
+  const userBubble = addMsg("user", userText);
+  const img = document.createElement("img");
+  img.src = `data:image/jpeg;base64,${b64}`;
+  img.className = "chat-img";
+  userBubble.querySelector(".text")!.before(img);
   msgInput.value = "";
 
   const bubble = addMsg("assistant", "⏳ analysing image…");
