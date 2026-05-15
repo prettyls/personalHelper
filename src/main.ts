@@ -14,6 +14,8 @@ const captureBtn = $<HTMLButtonElement>("captureBtn");
 const closeWcBtn = $<HTMLButtonElement>("closeWebcam");
 const uploadBtn = $<HTMLButtonElement>("uploadBtn");
 const uploadInput = $<HTMLInputElement>("uploadInput");
+const fileBtn = $<HTMLButtonElement>("fileBtn");
+const fileInput = $<HTMLInputElement>("fileInput");
 
 let mediaRecorder: MediaRecorder | null = null;
 let audioChunks: Blob[] = [];
@@ -208,6 +210,34 @@ uploadInput.addEventListener("change", async () => {
   };
   reader.readAsDataURL(file);
   uploadInput.value = "";
+});
+
+// ── file upload (PDF / text) ─────────────────────────────
+fileBtn.addEventListener("click", () => fileInput.click());
+
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files?.[0];
+  if (!file) return;
+
+  const userText = msgInput.value.trim() || "Please summarise this document.";
+  addMsg("user", `📄 [${file.name}] ${userText}`);
+  msgInput.value = "";
+
+  const bubble = addMsg("assistant", "⏳ reading file…");
+
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("message", userText);
+
+  try {
+    const res = await fetch("/api/chat-file", { method: "POST", body: fd });
+    await streamResponse(res, bubble);
+  } catch (e) {
+    bubble.querySelector(".text")!.textContent =
+      "❌ " + (e instanceof Error ? e.message : String(e));
+  }
+
+  fileInput.value = "";
 });
 
 // ── clear ────────────────────────────────────────────────

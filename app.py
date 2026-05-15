@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 from openai import OpenAI
+from PyPDF2 import PdfReader
 
 app = FastAPI()
 
@@ -107,6 +108,39 @@ async def chat_video(request: Request):
     })
     conversation_history.append({"role": "user", "content": f"[image] {user_msg}"})
     return _ollama_generate(messages, model=OLLAMA_VISION_MODEL)
+
+
+@app.post("/api/chat-file")
+async def chat_file(
+    file: UploadFile = File(...),
+    message: str = Form(""),
+):
+    """Upload a PDF or text file, extract content, and send to the text LLM."""
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+    raw = await file.read()
+
+    if ext == ".pdf":
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        try:
+            reader = PdfReader(tmp_path)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        finally:
+            os.unlink(tmp_path)
+    elif ext in (".txt", ".text", ".md", ".csv", ".json", ".xml", ".html", ".log"):
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        return {"error": f"Unsupported file type: {ext}"}
+
+    if not text.strip():
+        return {"error": "Could not extract any text from the file"}
+
+    prompt = message.strip() if message.strip() else "Please summarise the following document."
+    user_content = f"{prompt}\n\n---\n\n{text}"
+    conversation_history.append({"role": "user", "content": user_content})
+    return _ollama_generate(list(conversation_history))
 
 
 @app.post("/api/clear")
