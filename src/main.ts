@@ -1,3 +1,5 @@
+import { marked } from "marked";
+
 // ── DOM elements ─────────────────────────────────────────
 const $ = <T extends HTMLElement>(id: string): T =>
   document.getElementById(id) as T;
@@ -40,13 +42,20 @@ async function streamResponse(
   const decoder = new TextDecoder();
   const span = bubble.querySelector(".text") as HTMLSpanElement;
   span.textContent = "";
+  let fullText = "";
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    span.textContent += decoder.decode(value, { stream: true });
+    fullText += decoder.decode(value, { stream: true });
+    // Show raw text while streaming for responsiveness
+    span.textContent = fullText;
     chat.scrollTop = chat.scrollHeight;
   }
+
+  // Render final markdown to HTML
+  span.innerHTML = marked.parse(fullText) as string;
+  chat.scrollTop = chat.scrollHeight;
 }
 
 // ── text send ────────────────────────────────────────────

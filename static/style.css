@@ -32,6 +32,17 @@ header h1 { font-size: 1.3rem; }
 #closeWebcam { position: absolute; top: 8px; right: 12px; background: rgba(0,0,0,.5); color: #fff; border: none;
                border-radius: 50%; width: 28px; height: 28px; cursor: pointer; font-size: 1rem; }
 
+/* markdown rendered content */
+.msg.assistant .text h1, .msg.assistant .text h2, .msg.assistant .text h3 { margin: 8px 0 4px; }
+.msg.assistant .text p { margin: 4px 0; }
+.msg.assistant .text ul, .msg.assistant .text ol { margin: 4px 0; padding-left: 20px; }
+.msg.assistant .text pre { background: #1a1a2e; padding: 8px 12px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+.msg.assistant .text code { background: #1a1a2e; padding: 1px 4px; border-radius: 3px; font-size: 0.9em; }
+.msg.assistant .text pre code { background: none; padding: 0; }
+.msg.assistant .text table { border-collapse: collapse; margin: 6px 0; }
+.msg.assistant .text th, .msg.assistant .text td { border: 1px solid #555; padding: 4px 8px; }
+.msg.assistant .text blockquote { border-left: 3px solid #555; margin: 6px 0; padding-left: 10px; color: #aaa; }
+
 /* chat image preview */
 .chat-img { max-width: 100%; max-height: 240px; border-radius: 8px; margin-bottom: 6px; display: block; }
 
