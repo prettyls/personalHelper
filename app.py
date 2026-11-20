@@ -3,8 +3,11 @@ from __future__ import annotations
 import os
 import base64
 import json
+import shutil
+import subprocess
 import tempfile
 from typing import Optional
+from urllib.parse import urlparse
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +22,15 @@ OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4")              # text model
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen3.5:9b")  # vision model
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
+STREAM_MAX_SECONDS = int(os.getenv("STREAM_MAX_SECONDS", "120"))  # max media analysed
+STREAM_FRAME_COUNT = int(os.getenv("STREAM_FRAME_COUNT", "4"))    # frames sent to vision model
+
+# Restrict ffmpeg inputs so uploaded/remote media can't pull in local files.
+_CLIP_DEMUXERS = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpegts,flv,mp3,wav,ogg,aac,flac"
+_STREAM_PROTOCOLS = "http,https,tcp,tls,crypto,rtmp,rtmps,rtsp,udp,rtp"
+_STREAM_SCHEMES = {"http", "https", "rtmp", "rtmps", "rtsp"}
 
 # Conversation history (in-memory, per-server-lifetime)
 conversation_history: list[dict] = []
@@ -51,6 +63,97 @@ def _ollama_generate(messages: list[dict], model: Optional[str] = None):
             conversation_history.append({"role": "assistant", "content": full_response})
 
     return StreamingResponse(_stream(), media_type="text/plain")
+
+
+class MediaError(Exception):
+    pass
+
+
+def _run(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        raise MediaError(f"{cmd[0]} not found — install ffmpeg")
+    except subprocess.TimeoutExpired:
+        raise MediaError(f"{os.path.basename(cmd[0])} timed out")
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip().splitlines()
+        raise MediaError(err[-1] if err else f"{cmd[0]} failed")
+    return proc
+
+
+def _input_args(src: str) -> list[str]:
+    return ["-protocol_whitelist", "file", "-format_whitelist", _CLIP_DEMUXERS, "-i", src]
+
+
+def _load_stream(url: str, dest: str) -> None:
+    """Record up to STREAM_MAX_SECONDS of a remote stream into a local file."""
+    _run(
+        [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+         "-protocol_whitelist", _STREAM_PROTOCOLS, "-rw_timeout", "15000000",
+         "-i", url, "-t", str(STREAM_MAX_SECONDS),
+         "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", dest],
+        timeout=STREAM_MAX_SECONDS + 60,
+    )
+
+
+def _probe(src: str) -> dict:
+    proc = _run(
+        [FFPROBE_BIN, "-v", "error", "-print_format", "json",
+         "-show_format", "-show_streams",
+         "-protocol_whitelist", "file", "-format_whitelist", _CLIP_DEMUXERS, src],
+        timeout=30,
+    )
+    info = json.loads(proc.stdout or b"{}")
+    streams = info.get("streams", [])
+    try:
+        duration = float(info.get("format", {}).get("duration", 0) or 0)
+    except ValueError:
+        duration = 0.0
+    return {
+        "duration": duration,
+        "has_video": any(
+            s.get("codec_type") == "video"
+            and not s.get("disposition", {}).get("attached_pic")
+            for s in streams
+        ),
+        "has_audio": any(s.get("codec_type") == "audio" for s in streams),
+    }
+
+
+def _demux_frames(src: str, duration: float, workdir: str) -> list[str]:
+    """Extract evenly spaced JPEG frames (base64), like webcam captures."""
+    span = min(duration, STREAM_MAX_SECONDS)
+    count = max(1, STREAM_FRAME_COUNT) if span > 0 else 1
+    frames: list[str] = []
+    for i in range(count):
+        ts = span * (i + 0.5) / count if span > 0 else 0
+        out = os.path.join(workdir, f"frame_{i:02d}.jpg")
+        _run(
+            [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+             "-ss", f"{ts:.3f}", *_input_args(src),
+             "-map", "0:v:0", "-frames:v", "1",
+             "-vf", "scale='min(768,iw)':-2", "-q:v", "4", out],
+            timeout=60,
+        )
+        if os.path.exists(out):
+            with open(out, "rb") as f:
+                frames.append(base64.b64encode(f.read()).decode("ascii"))
+    return frames
+
+
+def _demux_audio(src: str, workdir: str) -> str:
+    """Extract the first audio track as mono 16 kHz Opus/WebM (base64), like mic recordings."""
+    out = os.path.join(workdir, "audio.webm")
+    _run(
+        [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+         *_input_args(src), "-t", str(STREAM_MAX_SECONDS),
+         "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+         "-c:a", "libopus", "-b:a", "32k", out],
+        timeout=STREAM_MAX_SECONDS + 60,
+    )
+    with open(out, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
 
 
 # ---------- endpoints ----------
@@ -91,23 +194,69 @@ async def transcribe(audio: UploadFile = File(...)):
 
 @app.post("/api/chat-video")
 async def chat_video(request: Request):
-    """Chat with a webcam frame. Expects JSON {message: string, image: base64}."""
+    """Chat with image(s). Expects JSON {message, image: base64} or {message, images: [base64]}."""
     body = await request.json()
     user_msg = body.get("message", "").strip() or "What do you see in this image?"
-    image_b64 = body.get("image", "")
+    images = body.get("images") or ([body["image"]] if body.get("image") else [])
 
-    if not image_b64:
+    if not images:
         return {"error": "no image provided"}
 
-    # Build message with image for Ollama vision model
+    # Build message with image(s) for Ollama vision model
     messages = list(conversation_history)
     messages.append({
         "role": "user",
         "content": user_msg,
-        "images": [image_b64],
+        "images": images,
     })
-    conversation_history.append({"role": "user", "content": f"[image] {user_msg}"})
+    tag = "[image]" if len(images) == 1 else f"[{len(images)} images]"
+    conversation_history.append({"role": "user", "content": f"{tag} {user_msg}"})
     return _ollama_generate(messages, model=OLLAMA_VISION_MODEL)
+
+
+@app.post("/api/demux")
+def demux(
+    file: Optional[UploadFile] = File(None),
+    url: str = Form(""),
+):
+    """Load an uploaded clip or a stream URL and demux it with ffmpeg.
+
+    Returns video frames (for /api/chat-video) and an audio track (for /api/transcribe).
+    """
+    url = url.strip()
+    if not file and not url:
+        return {"error": "provide a file or a stream URL"}
+    if url and urlparse(url).scheme.lower() not in _STREAM_SCHEMES:
+        return {"error": f"Unsupported stream URL scheme (use {', '.join(sorted(_STREAM_SCHEMES))})"}
+
+    workdir = tempfile.mkdtemp(prefix="demux_")
+    try:
+        if file:
+            suffix = os.path.splitext(file.filename or "")[1] or ".bin"
+            src = os.path.join(workdir, f"input{suffix}")
+            with open(src, "wb") as out:
+                shutil.copyfileobj(file.file, out)
+        else:
+            src = os.path.join(workdir, "input.mkv")
+            _load_stream(url, src)
+
+        info = _probe(src)
+        if not info["has_video"] and not info["has_audio"]:
+            return {"error": "No audio or video streams found"}
+
+        frames = _demux_frames(src, info["duration"], workdir) if info["has_video"] else []
+        audio = _demux_audio(src, workdir) if info["has_audio"] else None
+        return {
+            "source": file.filename if file else url,
+            "duration": info["duration"],
+            "frames": frames,
+            "audio": audio,
+            "audio_mime": "audio/webm" if audio else None,
+        }
+    except MediaError as e:
+        return {"error": f"ffmpeg: {e}"}
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 @app.post("/api/chat-file")

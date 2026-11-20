@@ -32,6 +32,17 @@ header h1 { font-size: 1.3rem; }
 #closeWebcam { position: absolute; top: 8px; right: 12px; background: rgba(0,0,0,.5); color: #fff; border: none;
                border-radius: 50%; width: 28px; height: 28px; cursor: pointer; font-size: 1rem; }
 
+/* stream / clip loader */
+#stream-container { display: flex; gap: 6px; align-items: center; padding: 8px 16px; background: #111; }
+#stream-container.hidden { display: none; }
+#streamUrl { flex: 1; background: #2d2d44; color: #eee; border: none; border-radius: 8px; padding: 6px 10px; font-size: .9rem; outline: none; }
+#stream-container button { flex-shrink: 0; padding: 6px 12px; border-radius: 8px; border: none; background: #0d47a1; color: #fff; cursor: pointer; }
+#stream-container #closeStream { background: none; font-size: 1rem; }
+
+/* sampled video frames in a chat bubble */
+.chat-frames { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 4px; margin-bottom: 6px; }
+.chat-frames .chat-img { margin: 0; max-height: 120px; width: 100%; object-fit: cover; }
+
 /* markdown rendered content */
 .msg.assistant .text h1, .msg.assistant .text h2, .msg.assistant .text h3 { margin: 8px 0 4px; }
 .msg.assistant .text p { margin: 4px 0; }

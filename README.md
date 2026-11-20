@@ -11,12 +11,14 @@ graph LR
         B[Audio Recording]
         C[Webcam Capture]
         D[Image Upload]
+        K[Stream / Clip]
         E[Response Display]
     end
     subgraph Backend["FastAPI Server"]
         F["/api/chat — Text"]
         G["/api/transcribe — Audio"]
-        H["/api/chat-video — Image+Text"]
+        H["/api/chat-video — Image(s)+Text"]
+        L["/api/demux — ffmpeg"]
     end
     subgraph External["AI Services"]
         I["OpenAI Whisper API\n(Audio → Text)"]
@@ -28,6 +30,9 @@ graph LR
     I -->|transcribed text| E
     C -->|POST frame| H
     D -->|POST image| H
+    K -->|POST file / URL| L
+    L -->|audio track| G
+    L -->|sampled frames + transcript| H
     F -->|prompt| J
     H -->|prompt+image| J
     J -->|streaming response| E
@@ -39,6 +44,7 @@ graph LR
 - **Node.js 16+** (for building TypeScript)
 - **Ollama** running locally — https://ollama.com
 - **OpenAI API key** (for Whisper audio transcription)
+- **ffmpeg / ffprobe** on `PATH` (for stream/clip analysis) — `brew install ffmpeg`
 
 ### Pull Ollama models
 
@@ -98,6 +104,9 @@ All models are configurable via environment variables:
 | `OLLAMA_VISION_MODEL` | `qwen3.5:9b` | Vision model (webcam & image upload) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OPENAI_API_KEY` | *(none)* | Required for audio transcription |
+| `FFMPEG_BIN` / `FFPROBE_BIN` | `ffmpeg` / `ffprobe` | ffmpeg binaries used for stream/clip demuxing |
+| `STREAM_MAX_SECONDS` | `120` | Max seconds of a stream/clip that is loaded and analysed |
+| `STREAM_FRAME_COUNT` | `4` | Number of evenly spaced frames sent to the vision model |
 
 ### Examples
 
@@ -122,6 +131,7 @@ Then restart the server to apply changes.
 | **Voice** | 🎤 | Click to start recording, click again to stop. Audio is transcribed via OpenAI Whisper, then sent to the LLM |
 | **Webcam** | 📷 | Opens camera preview. Optionally type a question, then click "Capture & Ask" |
 | **Image Upload** | 🖼️ | Pick an image file from disk. Optionally type a question before clicking |
+| **Stream / Clip** | 🎞️ | Enter a stream URL (http/https/HLS, rtmp, rtsp) or choose a local video/audio clip. ffmpeg demuxes it: the audio track goes through the voice path (Whisper), sampled frames go through the webcam path (vision model) together with the transcript. Optionally type a question first |
 
 ## Project Structure
 

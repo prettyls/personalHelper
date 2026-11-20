@@ -18,6 +18,13 @@ const uploadBtn = $<HTMLButtonElement>("uploadBtn");
 const uploadInput = $<HTMLInputElement>("uploadInput");
 const fileBtn = $<HTMLButtonElement>("fileBtn");
 const fileInput = $<HTMLInputElement>("fileInput");
+const streamBtn = $<HTMLButtonElement>("streamBtn");
+const streamCtr = $<HTMLDivElement>("stream-container");
+const streamUrl = $<HTMLInputElement>("streamUrl");
+const streamUrlBtn = $<HTMLButtonElement>("streamUrlBtn");
+const streamFileBtn = $<HTMLButtonElement>("streamFileBtn");
+const streamFileInput = $<HTMLInputElement>("streamFileInput");
+const closeStreamBtn = $<HTMLButtonElement>("closeStream");
 
 let mediaRecorder: MediaRecorder | null = null;
 let audioChunks: Blob[] = [];
@@ -59,11 +66,11 @@ async function streamResponse(
 }
 
 // ── text send ────────────────────────────────────────────
-async function sendText(text: string): Promise<void> {
+async function sendText(text: string, displayText?: string): Promise<void> {
   const trimmed = text.trim();
   if (!trimmed) return;
 
-  addMsg("user", trimmed);
+  addMsg("user", displayText ?? trimmed);
   msgInput.value = "";
   msgInput.style.height = "auto";
 
@@ -94,6 +101,15 @@ msgInput.addEventListener("input", () => {
 });
 
 // ── audio recording (OpenAI Whisper) ─────────────────────
+async function transcribeBlob(blob: Blob, filename: string): Promise<string> {
+  const fd = new FormData();
+  fd.append("audio", blob, filename);
+  const res = await fetch("/api/transcribe", { method: "POST", body: fd });
+  const data: { text?: string; error?: string } = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.text ?? "";
+}
+
 micBtn.addEventListener("click", async () => {
   if (mediaRecorder && mediaRecorder.state === "recording") {
     mediaRecorder.stop();
@@ -114,21 +130,13 @@ micBtn.addEventListener("click", async () => {
       const blob = new Blob(audioChunks, { type: "audio/webm" });
       addMsg("user", "🎤 (transcribing audio…)");
 
-      const fd = new FormData();
-      fd.append("audio", blob, "recording.webm");
-
       try {
-        const res = await fetch("/api/transcribe", { method: "POST", body: fd });
-        const data: { text?: string; error?: string } = await res.json();
-        if (data.error) {
-          addMsg("assistant", "❌ " + data.error);
-          return;
-        }
+        const text = await transcribeBlob(blob, "recording.webm");
         // replace last user msg with transcript
         const msgs = chat.querySelectorAll(".msg.user");
         const lastUser = msgs[msgs.length - 1];
-        lastUser.querySelector(".text")!.textContent = data.text!;
-        await sendText(data.text!);
+        lastUser.querySelector(".text")!.textContent = text;
+        await sendText(text);
       } catch (e) {
         addMsg(
           "assistant",
@@ -170,21 +178,33 @@ function closeWebcam(): void {
 closeWcBtn.addEventListener("click", closeWebcam);
 
 // ── shared image send ────────────────────────────────────
-async function sendImageWithQuestion(b64: string): Promise<void> {
-  const userText = msgInput.value.trim() || "What do you see?";
-  const userBubble = addMsg("user", userText);
-  const img = document.createElement("img");
-  img.src = `data:image/jpeg;base64,${b64}`;
-  img.className = "chat-img";
-  userBubble.querySelector(".text")!.before(img);
+async function sendImageWithQuestion(
+  images: string[],
+  question?: string,
+  displayText?: string
+): Promise<void> {
+  const userText = question ?? (msgInput.value.trim() || "What do you see?");
+  const userBubble = addMsg("user", displayText ?? userText);
+  const holder = document.createElement("div");
+  if (images.length > 1) holder.className = "chat-frames";
+  for (const b64 of images) {
+    const img = document.createElement("img");
+    img.src = `data:image/jpeg;base64,${b64}`;
+    img.className = "chat-img";
+    holder.appendChild(img);
+  }
+  userBubble.querySelector(".text")!.before(holder);
   msgInput.value = "";
 
-  const bubble = addMsg("assistant", "⏳ analysing image…");
+  const bubble = addMsg(
+    "assistant",
+    images.length > 1 ? "⏳ analysing frames…" : "⏳ analysing image…"
+  );
   try {
     const res = await fetch("/api/chat-video", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: userText, image: b64 }),
+      body: JSON.stringify({ message: userText, images }),
     });
     await streamResponse(res, bubble);
   } catch (e) {
@@ -201,7 +221,7 @@ captureBtn.addEventListener("click", async () => {
 
   const dataUrl = canvas.toDataURL("image/jpeg", 0.8);
   const b64 = dataUrl.split(",")[1];
-  await sendImageWithQuestion(b64);
+  await sendImageWithQuestion([b64]);
 });
 
 // ── upload image ─────────────────────────────────────────
@@ -215,7 +235,7 @@ uploadInput.addEventListener("change", async () => {
   reader.onload = async () => {
     const dataUrl = reader.result as string;
     const b64 = dataUrl.split(",")[1];
-    await sendImageWithQuestion(b64);
+    await sendImageWithQuestion([b64]);
   };
   reader.readAsDataURL(file);
   uploadInput.value = "";
@@ -247,6 +267,122 @@ fileInput.addEventListener("change", async () => {
   }
 
   fileInput.value = "";
+});
+
+// ── stream / clip analysis (ffmpeg demux) ────────────────
+interface DemuxResult {
+  source?: string;
+  duration?: number;
+  frames?: string[];
+  audio?: string | null;
+  audio_mime?: string | null;
+  error?: string;
+}
+
+function base64ToBlob(b64: string, type: string): Blob {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type });
+}
+
+async function analyseMedia(fd: FormData, label: string): Promise<void> {
+  const question =
+    msgInput.value.trim() || "Describe and summarise this video clip.";
+  msgInput.value = "";
+  closeStreamPanel();
+
+  const status = addMsg("assistant", `⏳ loading & demuxing ${label} with ffmpeg…`);
+  const statusText = status.querySelector(".text")!;
+  try {
+    const res = await fetch("/api/demux", { method: "POST", body: fd });
+    const data: DemuxResult = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    const frames = data.frames ?? [];
+    const source = data.source || label;
+
+    // audio track → same path as mic recording
+    let transcript = "";
+    if (data.audio) {
+      statusText.textContent = "⏳ transcribing audio track…";
+      try {
+        transcript = (
+          await transcribeBlob(
+            base64ToBlob(data.audio, data.audio_mime || "audio/webm"),
+            "stream-audio.webm"
+          )
+        ).trim();
+      } catch (e) {
+        addMsg(
+          "assistant",
+          "⚠️ Audio transcription failed, continuing without it: " +
+            (e instanceof Error ? e.message : String(e))
+        );
+      }
+    }
+    status.remove();
+
+    const dur = data.duration ? ` (${data.duration.toFixed(1)}s)` : "";
+    let prompt = question;
+    if (frames.length) {
+      prompt += `\n\nThe images are ${frames.length} frames sampled in order from the clip "${source}"${dur}.`;
+    }
+    if (transcript) {
+      prompt += `\n\nAudio transcript of the clip:\n"""\n${transcript}\n"""`;
+    } else if (!frames.length) {
+      throw new Error("No usable video frames or speech found in the clip");
+    }
+    const display =
+      `🎞️ [${source}]${dur} ${question}` +
+      (transcript ? `\n\n🎧 ${transcript}` : "");
+
+    // video frames → same path as webcam capture
+    if (frames.length) {
+      await sendImageWithQuestion(frames, prompt, display);
+    } else {
+      await sendText(prompt, display);
+    }
+  } catch (e) {
+    if (!status.isConnected) chat.appendChild(status);
+    statusText.textContent =
+      "❌ " + (e instanceof Error ? e.message : String(e));
+  }
+}
+
+function closeStreamPanel(): void {
+  streamCtr.classList.add("hidden");
+  streamUrl.value = "";
+}
+
+streamBtn.addEventListener("click", () => {
+  if (streamCtr.classList.toggle("hidden")) return;
+  streamUrl.focus();
+});
+closeStreamBtn.addEventListener("click", closeStreamPanel);
+
+streamUrlBtn.addEventListener("click", () => {
+  const url = streamUrl.value.trim();
+  if (!url) {
+    streamUrl.focus();
+    return;
+  }
+  const fd = new FormData();
+  fd.append("url", url);
+  analyseMedia(fd, "stream");
+});
+streamUrl.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.key === "Enter") streamUrlBtn.click();
+});
+
+streamFileBtn.addEventListener("click", () => streamFileInput.click());
+streamFileInput.addEventListener("change", () => {
+  const file = streamFileInput.files?.[0];
+  streamFileInput.value = "";
+  if (!file) return;
+  const fd = new FormData();
+  fd.append("file", file);
+  analyseMedia(fd, file.name);
 });
 
 // ── clear ────────────────────────────────────────────────
