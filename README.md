@@ -133,6 +133,12 @@ Then restart the server to apply changes.
 | **Image Upload** | 🖼️ | Pick an image file from disk. Optionally type a question before clicking |
 | **Stream / Clip** | 🎞️ | Enter a stream URL (http/https/HLS, rtmp, rtsp) or choose a local video/audio clip. ffmpeg demuxes it: the audio track goes through the voice path (Whisper), sampled frames go through the webcam path (vision model) together with the transcript. Optionally type a question first |
 
+If FFmpeg rejects an HLS master containing `#EXT-X-START` with
+“Master Playlist tag found in a Media Playlist”, the loader retries without
+that start hint, retaining all video variants and audio renditions. The retry
+uses FFmpeg's default live start position; local-file access remains disabled.
+Other FFmpeg failures include the underlying diagnostics in the error message.
+
 ## Project Structure
 
 ```

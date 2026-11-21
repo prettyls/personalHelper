@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import base64
 import json
+import logging
+import re
 import shutil
 import subprocess
 import tempfile
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +18,7 @@ from openai import OpenAI
 from PyPDF2 import PdfReader
 
 app = FastAPI()
+logger = logging.getLogger(__name__)
 
 # --- Config ---
 OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -69,16 +72,18 @@ class MediaError(Exception):
     pass
 
 
-def _run(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
+def _run(
+    cmd: list[str], timeout: float, input_data: Optional[bytes] = None
+) -> subprocess.CompletedProcess:
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, input=input_data)
     except FileNotFoundError:
         raise MediaError(f"{cmd[0]} not found — install ffmpeg")
     except subprocess.TimeoutExpired:
         raise MediaError(f"{os.path.basename(cmd[0])} timed out")
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", errors="replace").strip().splitlines()
-        raise MediaError(err[-1] if err else f"{cmd[0]} failed")
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise MediaError(err[-4000:] if err else f"{cmd[0]} failed")
     return proc
 
 
@@ -88,12 +93,63 @@ def _input_args(src: str) -> list[str]:
 
 def _load_stream(url: str, dest: str) -> None:
     """Record up to STREAM_MAX_SECONDS of a remote stream into a local file."""
+    output_args = [
+        "-t", str(STREAM_MAX_SECONDS),
+        "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", dest,
+    ]
+    try:
+        _run(
+            [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+             "-protocol_whitelist", _STREAM_PROTOCOLS, "-rw_timeout", "15000000",
+             "-i", url, *output_args],
+            timeout=STREAM_MAX_SECONDS + 60,
+        )
+        return
+    except MediaError as e:
+        if (
+            "Master Playlist tag found in a Media Playlist" not in str(e)
+            or urlparse(url).scheme.lower() not in {"http", "https"}
+        ):
+            raise
+        original_error = e
+
+    try:
+        response = httpx.get(url, timeout=15.0, follow_redirects=True)
+        response.raise_for_status()
+    except httpx.HTTPError as e:
+        raise MediaError(f"Could not reload HLS master playlist: {e}") from e
+
+    lines = [line.strip() for line in response.text.splitlines()]
+    if (
+        not lines or lines[0] != "#EXTM3U"
+        or not any(line.startswith("#EXT-X-STREAM-INF:") for line in lines)
+        or not any(line.startswith("#EXT-X-START:") for line in lines)
+    ):
+        raise original_error
+
+    # FFmpeg 9 treats EXT-X-START as a media-only tag, rejecting valid masters.
+    # stdin has no URL base, so retain all renditions with absolute references.
+    playlist = []
+    for line in lines:
+        if line.startswith("#EXT-X-START:"):
+            continue
+        if line.startswith("#"):
+            line = re.sub(
+                r'URI="([^"]*)"',
+                lambda match: f'URI="{urljoin(str(response.url), match[1])}"',
+                line,
+            )
+        elif line:
+            line = urljoin(str(response.url), line)
+        playlist.append(line)
+
+    logger.warning("Retrying HLS master without EXT-X-START for FFmpeg compatibility")
     _run(
         [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
-         "-protocol_whitelist", _STREAM_PROTOCOLS, "-rw_timeout", "15000000",
-         "-i", url, "-t", str(STREAM_MAX_SECONDS),
-         "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", dest],
+         "-protocol_whitelist", f"pipe,{_STREAM_PROTOCOLS}", "-rw_timeout", "15000000",
+         "-f", "hls", "-i", "pipe:0", *output_args],
         timeout=STREAM_MAX_SECONDS + 60,
+        input_data=("\n".join(playlist) + "\n").encode("utf-8"),
     )
 
 
