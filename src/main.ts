@@ -19,6 +19,7 @@ const uploadInput = $<HTMLInputElement>("uploadInput");
 const fileBtn = $<HTMLButtonElement>("fileBtn");
 const fileInput = $<HTMLInputElement>("fileInput");
 const streamBtn = $<HTMLButtonElement>("streamBtn");
+const captionBtn = $<HTMLButtonElement>("captionBtn");
 const streamCtr = $<HTMLDivElement>("stream-container");
 const streamUrl = $<HTMLInputElement>("streamUrl");
 const streamUrlBtn = $<HTMLButtonElement>("streamUrlBtn");
@@ -29,6 +30,7 @@ const closeStreamBtn = $<HTMLButtonElement>("closeStream");
 let mediaRecorder: MediaRecorder | null = null;
 let audioChunks: Blob[] = [];
 let webcamStream: MediaStream | null = null;
+let compareCaptions = false;
 
 // ── helpers ──────────────────────────────────────────────
 function addMsg(role: "user" | "assistant", text: string): HTMLDivElement {
@@ -101,13 +103,26 @@ msgInput.addEventListener("input", () => {
 });
 
 // ── audio recording (OpenAI Whisper) ─────────────────────
-async function transcribeBlob(blob: Blob, filename: string): Promise<string> {
+interface Transcription {
+  text?: string;
+  segments?: { start: number; end: number; text: string }[];
+  error?: string;
+}
+
+async function transcribeAudio(blob: Blob, filename: string): Promise<Transcription> {
   const fd = new FormData();
   fd.append("audio", blob, filename);
   const res = await fetch("/api/transcribe", { method: "POST", body: fd });
-  const data: { text?: string; error?: string } = await res.json();
+  const data: Transcription = await res.json();
   if (data.error) throw new Error(data.error);
-  return data.text ?? "";
+  if (!res.ok) throw new Error(`Transcription failed (HTTP ${res.status})`);
+  if (typeof data.text !== "string") throw new Error("Transcription response has no text");
+  return data;
+}
+
+async function transcribeBlob(blob: Blob, filename: string): Promise<string> {
+  const data = await transcribeAudio(blob, filename);
+  return data.text!;
 }
 
 micBtn.addEventListener("click", async () => {
@@ -276,6 +291,7 @@ interface DemuxResult {
   frames?: string[];
   audio?: string | null;
   audio_mime?: string | null;
+  captions?: { text: string; source: string; language?: string | null } | null;
   error?: string;
 }
 
@@ -286,9 +302,14 @@ function base64ToBlob(b64: string, type: string): Blob {
   return new Blob([bytes], { type });
 }
 
-async function analyseMedia(fd: FormData, label: string): Promise<void> {
+async function analyseMedia(
+  fd: FormData, label: string, comparison: boolean
+): Promise<void> {
   const question =
-    msgInput.value.trim() || "Describe and summarise this video clip.";
+    msgInput.value.trim() || (comparison
+      ? "Compare the captions with the audio transcript."
+      : "Describe and summarise this video clip.");
+  if (comparison) fd.append("compare_captions", "true");
   msgInput.value = "";
   closeStreamPanel();
 
@@ -301,6 +322,41 @@ async function analyseMedia(fd: FormData, label: string): Promise<void> {
 
     const frames = data.frames ?? [];
     const source = data.source || label;
+
+    if (comparison) {
+      if (!data.captions?.text || !data.audio) {
+        throw new Error("Both captions and audio are required for comparison");
+      }
+      statusText.textContent = "⏳ transcribing audio track…";
+      const transcript = await transcribeAudio(
+        base64ToBlob(data.audio, data.audio_mime || "audio/webm"),
+        "stream-audio.webm"
+      );
+      if (!transcript.text?.trim()) {
+        throw new Error("No speech was transcribed; cannot compare captions");
+      }
+      const captionSource = data.captions.source +
+        (data.captions.language ? ` (${data.captions.language})` : "");
+      const timedTranscript = transcript.segments?.length
+        ? `\n\nTranscript segments (seconds):\n${JSON.stringify(transcript.segments)}`
+        : "";
+      const timingWarning = fd.has("url")
+        ? "\n\nStream captions may be incomplete or misaligned; do not conclude that speech is missing solely from timestamps or absent cues."
+        : "";
+      const prompt = `${question}\n\nCompare the caption text and audio transcript below. ` +
+        "Identify matching speech, missing or extra words, and meaningful discrepancies. " +
+        "Treat timestamps as approximate and do not invent missing content." + timingWarning +
+        `\n\nCaptions (${captionSource}, SRT):\n${data.captions.text}` +
+        `\n\nAudio transcript:\n${transcript.text}${timedTranscript}`;
+      status.remove();
+      await sendText(
+        prompt,
+        `🔤 [${source}] ${question}\n\nCaptions (${captionSource}):\n${data.captions.text}` +
+          `\n\n🎧 ${transcript.text}` +
+          (timingWarning ? "\n\n⚠️ Stream captions may be incomplete or misaligned." : "")
+      );
+      return;
+    }
 
     // audio track → same path as mic recording
     let transcript = "";
@@ -355,10 +411,19 @@ function closeStreamPanel(): void {
   streamUrl.value = "";
 }
 
-streamBtn.addEventListener("click", () => {
-  if (streamCtr.classList.toggle("hidden")) return;
+function openStreamPanel(comparison: boolean): void {
+  if (!streamCtr.classList.contains("hidden") && compareCaptions === comparison) {
+    closeStreamPanel();
+    return;
+  }
+  compareCaptions = comparison;
+  streamUrlBtn.textContent = comparison ? "▶ Compare URL" : "▶ Analyse URL";
+  streamFileBtn.textContent = comparison ? "📁 Compare clip" : "📁 Choose clip";
+  streamCtr.classList.remove("hidden");
   streamUrl.focus();
-});
+}
+streamBtn.addEventListener("click", () => openStreamPanel(false));
+captionBtn.addEventListener("click", () => openStreamPanel(true));
 closeStreamBtn.addEventListener("click", closeStreamPanel);
 
 streamUrlBtn.addEventListener("click", () => {
@@ -369,7 +434,7 @@ streamUrlBtn.addEventListener("click", () => {
   }
   const fd = new FormData();
   fd.append("url", url);
-  analyseMedia(fd, "stream");
+  analyseMedia(fd, "stream", compareCaptions);
 });
 streamUrl.addEventListener("keydown", (e: KeyboardEvent) => {
   if (e.key === "Enter") streamUrlBtn.click();
@@ -382,7 +447,7 @@ streamFileInput.addEventListener("change", () => {
   if (!file) return;
   const fd = new FormData();
   fd.append("file", file);
-  analyseMedia(fd, file.name);
+  analyseMedia(fd, file.name, compareCaptions);
 });
 
 // ── clear ────────────────────────────────────────────────

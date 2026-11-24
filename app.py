@@ -27,6 +27,7 @@ OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "qwen3.5:9b")  # vision m
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
+CCEXTRACTOR_BIN = os.getenv("CCEXTRACTOR_BIN", "ccextractor")
 STREAM_MAX_SECONDS = int(os.getenv("STREAM_MAX_SECONDS", "120"))  # max media analysed
 STREAM_FRAME_COUNT = int(os.getenv("STREAM_FRAME_COUNT", "4"))    # frames sent to vision model
 
@@ -91,17 +92,21 @@ def _input_args(src: str) -> list[str]:
     return ["-protocol_whitelist", "file", "-format_whitelist", _CLIP_DEMUXERS, "-i", src]
 
 
-def _load_stream(url: str, dest: str) -> None:
+def _load_stream(url: str, dest: str, include_subtitles: bool = False) -> None:
     """Record up to STREAM_MAX_SECONDS of a remote stream into a local file."""
-    output_args = [
-        "-t", str(STREAM_MAX_SECONDS),
-        "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", dest,
-    ]
+    output_args = ["-t", str(STREAM_MAX_SECONDS), "-map", "0:v:0?", "-map", "0:a:0?"]
+    if include_subtitles:
+        output_args += ["-map", "0:s:0?", "-c:s", "srt"]
+    output_args += ["-c:v", "copy", "-c:a", "copy", dest]
+    input_options = (
+        ["-analyzeduration", "100000", "-probesize", "32768"]
+        if include_subtitles else []
+    )
     try:
         _run(
             [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
              "-protocol_whitelist", _STREAM_PROTOCOLS, "-rw_timeout", "15000000",
-             "-i", url, *output_args],
+             *input_options, "-i", url, *output_args],
             timeout=STREAM_MAX_SECONDS + 60,
         )
         return
@@ -147,7 +152,7 @@ def _load_stream(url: str, dest: str) -> None:
     _run(
         [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
          "-protocol_whitelist", f"pipe,{_STREAM_PROTOCOLS}", "-rw_timeout", "15000000",
-         "-f", "hls", "-i", "pipe:0", *output_args],
+         *input_options, "-f", "hls", "-i", "pipe:0", *output_args],
         timeout=STREAM_MAX_SECONDS + 60,
         input_data=("\n".join(playlist) + "\n").encode("utf-8"),
     )
@@ -174,6 +179,16 @@ def _probe(src: str) -> dict:
             for s in streams
         ),
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
+        "video_codec": next(
+            (s.get("codec_name") for s in streams
+             if s.get("codec_type") == "video"
+             and not s.get("disposition", {}).get("attached_pic")),
+            None,
+        ),
+        "subtitles": [
+            {"codec": s.get("codec_name"), "language": s.get("tags", {}).get("language")}
+            for s in streams if s.get("codec_type") == "subtitle"
+        ],
     }
 
 
@@ -212,6 +227,59 @@ def _demux_audio(src: str, workdir: str) -> str:
         return base64.b64encode(f.read()).decode("ascii")
 
 
+def _demux_captions(src: str, info: dict, workdir: str) -> dict:
+    """Extract the first text subtitle track or embedded CEA-608/708 captions."""
+    if info["subtitles"]:
+        subtitle = info["subtitles"][0]
+        proc = _run(
+            [FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
+             *_input_args(src), "-t", str(STREAM_MAX_SECONDS),
+             "-map", "0:s:0", "-c:s", "srt", "-f", "srt", "pipe:1"],
+            timeout=STREAM_MAX_SECONDS + 60,
+        )
+        text = proc.stdout.decode("utf-8", errors="replace").strip()
+        if text:
+            return {"text": text, "source": "subtitle track",
+                    "language": subtitle["language"]}
+
+    if not info["has_video"]:
+        raise MediaError("No captions found in the selected media interval")
+    if info["video_codec"] not in {"h264", "hevc", "mpeg2video"}:
+        raise MediaError(
+            f"Embedded caption extraction is not supported for video codec: {info['video_codec']}"
+        )
+    if not shutil.which(CCEXTRACTOR_BIN):
+        raise MediaError("ccextractor not found; install it to extract embedded CEA-608/708 captions")
+
+    transport = os.path.join(workdir, "captions.ts")
+    _run(
+        [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+         *_input_args(src), "-t", str(STREAM_MAX_SECONDS),
+         "-map", "0:v:0", "-c:v", "copy", "-f", "mpegts", transport],
+        timeout=STREAM_MAX_SECONDS + 60,
+    )
+    for label, selection in (("CEA-708 service 1", ["--service", "1"]),
+                             ("CEA-608 field 1", ["-1"])):
+        try:
+            proc = subprocess.run(
+                [CCEXTRACTOR_BIN, "--stdout", "--out", "srt", "--no-typesetting",
+                 *selection, transport],
+                capture_output=True, timeout=STREAM_MAX_SECONDS + 60,
+            )
+        except FileNotFoundError as e:
+            raise MediaError("ccextractor not found; install it to extract embedded captions") from e
+        except subprocess.TimeoutExpired as e:
+            raise MediaError("ccextractor timed out") from e
+        # CCExtractor uses exit code 10 for inputs with no captions.
+        if proc.returncode not in (0, 10):
+            error = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise MediaError(f"ccextractor failed: {error[-4000:]}")
+        text = proc.stdout.decode("utf-8-sig", errors="replace").strip()
+        if text:
+            return {"text": text, "source": label, "language": None}
+    raise MediaError("No captions found in the selected media interval")
+
+
 # ---------- endpoints ----------
 @app.post("/api/chat")
 async def chat(request: Request):
@@ -227,7 +295,7 @@ async def chat(request: Request):
 
 @app.post("/api/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
-    """Transcribe audio using OpenAI Whisper API, then return text."""
+    """Transcribe audio using OpenAI Whisper and return verbose JSON."""
     if not OPENAI_API_KEY:
         return {"error": "OPENAI_API_KEY not set"}
 
@@ -240,10 +308,10 @@ async def transcribe(audio: UploadFile = File(...)):
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
         with open(tmp_path, "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1", file=f
+            response = client.audio.transcriptions.with_raw_response.create(
+                model="whisper-1", file=f, response_format="verbose_json"
             )
-        return {"text": transcript.text}
+        return response.http_response.json()
     finally:
         os.unlink(tmp_path)
 
@@ -274,10 +342,11 @@ async def chat_video(request: Request):
 def demux(
     file: Optional[UploadFile] = File(None),
     url: str = Form(""),
+    compare_captions: bool = Form(False),
 ):
     """Load an uploaded clip or a stream URL and demux it with ffmpeg.
 
-    Returns video frames (for /api/chat-video) and an audio track (for /api/transcribe).
+    Returns video frames and audio, or captions and audio for comparison.
     """
     url = url.strip()
     if not file and not url:
@@ -294,13 +363,26 @@ def demux(
                 shutil.copyfileobj(file.file, out)
         else:
             src = os.path.join(workdir, "input.mkv")
-            _load_stream(url, src)
+            _load_stream(url, src, include_subtitles=compare_captions)
 
         info = _probe(src)
         if not info["has_video"] and not info["has_audio"]:
             return {"error": "No audio or video streams found"}
 
-        frames = _demux_frames(src, info["duration"], workdir) if info["has_video"] else []
+        if compare_captions and not info["has_audio"]:
+            return {"error": "No audio track found for caption comparison"}
+        try:
+            captions = _demux_captions(src, info, workdir) if compare_captions else None
+        except MediaError as e:
+            if not file and "No captions found" in str(e):
+                raise MediaError(
+                    f"{e}. FFmpeg may omit HLS WebVTT cues with X-TIMESTAMP-MAP."
+                ) from e
+            raise
+        frames = (
+            _demux_frames(src, info["duration"], workdir)
+            if info["has_video"] and not compare_captions else []
+        )
         audio = _demux_audio(src, workdir) if info["has_audio"] else None
         return {
             "source": file.filename if file else url,
@@ -308,6 +390,7 @@ def demux(
             "frames": frames,
             "audio": audio,
             "audio_mime": "audio/webm" if audio else None,
+            "captions": captions,
         }
     except MediaError as e:
         return {"error": f"ffmpeg: {e}"}
