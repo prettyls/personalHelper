@@ -22,6 +22,15 @@
     <button id="closeWebcam">✕</button>
   </div>
 
+  <!-- Stream / clip loader (hidden until activated) -->
+  <div id="stream-container" class="hidden">
+    <input type="url" id="streamUrl" placeholder="Stream URL (http, https, rtmp, rtsp)…" />
+    <button id="streamUrlBtn">▶ Analyse URL</button>
+    <button id="streamFileBtn">📁 Choose clip</button>
+    <input type="file" id="streamFileInput" accept="video/*,audio/*,.mkv,.ts,.flv" hidden />
+    <button id="closeStream" title="Close">✕</button>
+  </div>
+
   <div id="input-bar">
     <textarea id="msgInput" rows="1" placeholder="Type a message…"></textarea>
     <button id="sendBtn" title="Send">➤</button>
@@ -29,6 +38,10 @@
     <button id="camBtn" title="Webcam input">📷</button>
     <button id="uploadBtn" title="Upload image">🖼️</button>
     <input type="file" id="uploadInput" accept="image/*" hidden />
+    <button id="fileBtn" title="Upload PDF or text file">📄</button>
+    <input type="file" id="fileInput" accept=".pdf,.txt,.text,.md,.csv,.json,.xml,.html,.log" hidden />
+    <button id="streamBtn" title="Analyse video clip or stream">🎞️</button>
+    <button id="captionBtn" title="Compare captions with audio transcript">🔤</button>
   </div>
 </div>
 <script src="/static/main.js"></script>
